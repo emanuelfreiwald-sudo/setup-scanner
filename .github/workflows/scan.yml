@@ -61,6 +61,6 @@ jobs:
           date -u +"%Y-%m-%d %H:%M UTC" > last_run.txt
           git config user.name "scan-bot"
           git config user.email "scan-bot@users.noreply.github.com"
-          git add last_run.txt
+          git add last_run.txt state.json
           git commit -m "Lauf $(cat last_run.txt)" || true
           git push || true
