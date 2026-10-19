@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import html as htmllib
 import io
+import json
 import os
 import sys
 import time
@@ -48,6 +49,7 @@ INCLUDE_FORMING_BAR = True   # True: laufende (noch nicht geschlossene) Kerze z�
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 UNIVERSE_FILE = BASE_DIR / "universe.csv"
+STATE_FILE = BASE_DIR / "state.json"   # Merkt sich, seit wann ein Treffer besteht (Automatik-Modus)
 SITE_DIR = BASE_DIR / "site"   # Ausgabeordner im Automatik-Modus (wird als Webseite veröffentlicht)
 
 # Zeitfenster (New Yorker Zeit, Mo-Fr), in denen der Automatik-Lauf wirklich scannt: jeweils vor dem
@@ -327,12 +329,18 @@ button{font:inherit;font-size:13px;background:var(--btn);color:var(--ink);border
 border-radius:6px;padding:5px 10px;cursor:pointer}
 button:hover{border-color:var(--accent)}
 button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.group{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:0 0 12px;overflow:hidden}
+.group{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:0 0 12px;overflow-x:auto}
 .group>header{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;
 background:var(--btn);font-weight:600}
 .group>header span{font-weight:400;color:var(--muted);margin-left:8px}
-table{width:100%;border-collapse:collapse;table-layout:fixed}
-th:nth-child(1){width:90px}th:nth-child(3){width:90px}th:nth-child(4),th:nth-child(5),th:nth-child(6){width:120px}
+table{width:100%;min-width:820px;border-collapse:collapse;table-layout:fixed}
+th:nth-child(1){width:90px}th:nth-child(3){width:90px}th:nth-child(4){width:150px}th:nth-child(n+5){width:125px}
+td.when{white-space:nowrap}
+.new{display:inline-block;margin-left:6px;padding:0 6px;border-radius:4px;font-size:11px;font-weight:650;background:var(--accent);color:var(--panel)}
+.head small{font-size:13px;font-weight:400;color:var(--muted);margin-left:8px}
+.btns{display:flex;gap:8px;flex-wrap:wrap}
+button[disabled]{opacity:.45;cursor:default}
+.legend{color:var(--muted);font-size:13px;margin:-8px 0 24px}
 td:nth-child(2){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 th,td{text-align:left;padding:7px 12px;border-top:1px solid var(--line);font-variant-numeric:tabular-nums}
 th{font-weight:500;color:var(--muted);font-size:13px;border-top:0}
@@ -341,7 +349,6 @@ a{color:var(--accent);text-decoration:none;font-weight:650}
 a:hover{text-decoration:underline}
 .empty{color:var(--muted);padding:14px 12px}
 footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:14px}
-@media (max-width:640px){th:nth-child(2),td:nth-child(2){display:none}}
 """
 
 JS = """
@@ -368,25 +375,86 @@ def _esc(x) -> str:
     return htmllib.escape(str(x), quote=True)
 
 
-def _group_rows(df: pd.DataFrame, side: str) -> list[tuple[str, pd.DataFrame]]:
-    groups = [(etf, g.sort_values("ticker")) for etf, g in df.groupby("sector_etf")]
+WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+
+def fmt_when(iso: str | None) -> str:
+    """ISO-Zeitstempel -> 'Mo 19.10. 17:43' (Wiener Zeit)."""
+    if not iso:
+        return "-"
+    ts = pd.Timestamp(iso).astimezone(VIE)
+    return f"{WEEKDAYS[ts.weekday()]} {ts:%d.%m. %H:%M}"
+
+
+def load_state(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+
+
+def update_state(prev: dict | None, results: pd.DataFrame, now: pd.Timestamp) -> tuple[dict, dict]:
+    """Merkt sich pro Treffer, bei welchem Lauf er zum ersten Mal aufgetaucht ist.
+
+    Rückgabe: (neuer Stand, {"long": {neue Ticker}, "short": {neue Ticker}}).
+    Ein Treffer, der aus der Liste verschwindet und später wiederkommt, gilt erneut als neu.
+    """
+    stamp = now.isoformat()
+    scanned = set(results["ticker"]) if len(results) else set()
+    state: dict = {"long": {}, "short": {}}
+    new: dict = {"long": set(), "short": set()}
+    for side in ("long", "short"):
+        old = (prev or {}).get(side, {})
+        current = list(results.loc[results[side], "ticker"]) if len(results) else []
+        for t in current:
+            if t in old:
+                state[side][t] = old[t]
+            else:
+                state[side][t] = stamp
+                new[side].add(t)
+        for t, ts in old.items():          # Aktie hatte diesmal keine Daten: Eintrag kurz behalten
+            if t not in scanned and (now - pd.Timestamp(ts)).days < 3:
+                state[side][t] = ts
+    return state, new
+
+
+def _group_rows(df: pd.DataFrame, new=frozenset()) -> list[tuple[str, pd.DataFrame]]:
+    """Nach Sektor gruppiert (größte Gruppe zuerst), darin neue Treffer zuerst."""
+    groups = []
+    for etf, g in df.groupby("sector_etf"):
+        g = g.assign(_old=~g["ticker"].isin(new)).sort_values(["_old", "ticker"]).drop(columns="_old")
+        groups.append((etf, g))
     groups.sort(key=lambda x: (-len(x[1]), x[0]))
     return groups
 
 
-def render_section(df: pd.DataFrame, side: str) -> tuple[str, str]:
-    """Gibt (HTML, TradingView-Watchlist-Text) für Long oder Short zurück."""
+def _tv_text(df: pd.DataFrame, side: str) -> str:
+    """TradingView-Importformat mit Abschnitten pro Sektor."""
     title = "Long" if side == "long" else "Short"
-    groups = _group_rows(df, side)
-    tv_parts, body = [], []
-    for etf, g in groups:
+    return ",".join(f"###{title} {etf}," + ",".join(g["ticker"]) for etf, g in _group_rows(df))
+
+
+def render_section(df: pd.DataFrame, side: str, first_seen: dict | None = None,
+                   new: set | None = None) -> tuple[str, str, str]:
+    """Gibt (HTML, TradingView-Text aller Treffer, TradingView-Text nur der neuen) zurück."""
+    first_seen, new = first_seen or {}, new or set()
+    title = "Long" if side == "long" else "Short"
+    body = []
+    for etf, g in _group_rows(df, new):
         tickers = list(g["ticker"])
-        tv_parts.append(f"###{title} {etf}," + ",".join(tickers))
         rows = "".join(
             "<tr>"
             f'<td><a href="https://www.tradingview.com/chart/?symbol={_esc(r.ticker)}" target="_blank" rel="noopener">{_esc(r.ticker)}</a></td>'
             f"<td>{_esc(r.name)}</td>"
             f'<td class="num">{r.price:,.2f}</td>'
+            f'<td class="when">{_esc(fmt_when(first_seen.get(r.ticker)))}'
+            f'{"<span class=new>NEU</span>" if r.ticker in new else ""}</td>'
             f'<td class="num">{_age_text(getattr(r, "ema_" + side))}</td>'
             f'<td class="num">{_age_text(getattr(r, "candle_" + side))}</td>'
             f'<td class="num">{_age_text(getattr(r, "rsi_" + side))}</td>'
@@ -398,26 +466,33 @@ def render_section(df: pd.DataFrame, side: str) -> tuple[str, str]:
             f'<div>{_esc(etf)} {_esc(SECTOR_NAME_DE.get(etf, ""))}'
             f'<span>{len(g)} Treffer</span></div>'
             f'<button data-copy="{_esc(",".join(tickers))}">Ticker kopieren</button></header>'
-            "<table><thead><tr><th>Ticker</th><th>Name</th><th class=\"num\">Kurs</th>"
+            "<table><thead><tr><th>Ticker</th><th>Name</th><th class=\"num\">Kurs</th><th>Entstanden</th>"
             "<th class=\"num\">EMA-Kreuzung</th><th class=\"num\">Kerze</th><th class=\"num\">RSI-Kreuzung</th>"
             f"</tr></thead><tbody>{rows}</tbody></table></div>"
         )
-    tv_text = ",".join(tv_parts)
     if not body:
         body.append('<div class="group"><div class="empty">Aktuell kein Treffer.</div></div>')
+    new_here = df[df["ticker"].isin(new)] if len(df) else df
+    tv_all = _tv_text(df, side) if len(df) else ""
+    tv_new = _tv_text(new_here, side) if len(new_here) else ""
     head = (
-        f'<div class="head {side}"><h2>{title} ({len(df)})</h2>'
-        f'<button data-copy="{_esc(tv_text)}"{" disabled" if not len(df) else ""}>Als TradingView-Liste kopieren</button></div>'
+        f'<div class="head {side}"><h2>{title} ({len(df)})'
+        f'<small>{len(new_here)} neu bei diesem Lauf</small></h2><div class="btns">'
+        f'<button data-copy="{_esc(tv_new)}"{"" if len(new_here) else " disabled"}>Nur neue kopieren ({len(new_here)})</button>'
+        f'<button data-copy="{_esc(tv_all)}"{"" if len(df) else " disabled"}>Alle kopieren</button></div></div>'
     )
-    return f"<section>{head}{''.join(body)}</section>", tv_text
+    return f"<section>{head}{''.join(body)}</section>", tv_all, tv_new
 
 
 def render_html(results: pd.DataFrame, now: pd.Timestamp, include_forming: bool,
-                n_universe: int, data_until: pd.Timestamp | None = None) -> tuple[str, str]:
+                n_universe: int, data_until: pd.Timestamp | None = None,
+                state: dict | None = None, new: dict | None = None) -> tuple[str, str, str]:
+    state = state or {"long": {}, "short": {}}
+    new = new or {"long": set(), "short": set()}
     longs = results[results["long"]] if len(results) else results
     shorts = results[results["short"]] if len(results) else results
-    long_html, long_tv = render_section(longs, "long")
-    short_html, short_tv = render_section(shorts, "short")
+    long_html, long_tv, long_new = render_section(longs, "long", state.get("long"), new.get("long"))
+    short_html, short_tv, short_new = render_section(shorts, "short", state.get("short"), new.get("short"))
     mode = "mit laufender Kerze" if include_forming else "nur abgeschlossene Kerzen"
     stamp = now.astimezone(VIE).strftime("%d.%m.%Y %H:%M")
     until = (f", Kursdaten bis {data_until.astimezone(VIE).strftime('%d.%m. %H:%M')}"
@@ -428,21 +503,25 @@ def render_html(results: pd.DataFrame, now: pd.Timestamp, include_forming: bool,
 <h1>Setup-Scan</h1>
 <p class="meta">Stand {stamp} (Wiener Zeit){until}, {mode}. {len(results)} von {n_universe} Aktien ausgewertet.
 Signale auf dem {SIGNAL_MINUTES}-Minuten-Chart, Toleranz {LOOKBACK} Kerzen, kein Trendfilter.</p>
+<p class="legend"><span class="new" style="margin:0">NEU</span> = bei diesem Lauf dazugekommen.
+&bdquo;Entstanden&ldquo; = Lauf, bei dem der Treffer zum ersten Mal aufgetaucht ist (Wiener Zeit).</p>
 {long_html}
 {short_html}
 <footer>Kursdaten von Yahoo Finance, sie können leicht von TradingView abweichen. Bitte jeden Treffer im Chart prüfen.
 Das ist eine technische Auswertung und keine Anlageberatung.</footer>
 </main><script>{JS}</script></body></html>"""
     tv_all = ",".join(x for x in (long_tv, short_tv) if x)
-    return page, tv_all
+    tv_new = ",".join(x for x in (long_new, short_new) if x)
+    return page, tv_all, tv_new
 
 
 def write_outputs(results: pd.DataFrame, now: pd.Timestamp, include_forming: bool,
                   n_universe: int, open_browser: bool, ci: bool = False,
-                  data_until: pd.Timestamp | None = None) -> Path:
+                  data_until: pd.Timestamp | None = None,
+                  state: dict | None = None, new: dict | None = None) -> Path:
     out = SITE_DIR if ci else OUTPUT_DIR
     out.mkdir(exist_ok=True)
-    page, tv_all = render_html(results, now, include_forming, n_universe, data_until)
+    page, tv_all, tv_new = render_html(results, now, include_forming, n_universe, data_until, state, new)
     if ci:
         main_page = out / "index.html"
         main_page.write_text(page, encoding="utf-8")
@@ -452,6 +531,7 @@ def write_outputs(results: pd.DataFrame, now: pd.Timestamp, include_forming: boo
         main_page.write_text(page, encoding="utf-8")
         (out / f"scan_{stamp}.html").write_text(page, encoding="utf-8")
     (out / "tradingview_watchlist.txt").write_text(tv_all, encoding="utf-8")
+    (out / "tradingview_watchlist_neu.txt").write_text(tv_new, encoding="utf-8")
     results.to_csv(out / "alle_ergebnisse.csv", index=False)
     if open_browser and not ci:
         webbrowser.open(main_page.as_uri())
@@ -499,8 +579,11 @@ def main() -> None:
         data_until = pd.Timestamp(max(last_bars))
         data_until = (data_until.tz_localize("UTC") if data_until.tzinfo is None else data_until)
         data_until = data_until + pd.Timedelta(minutes=15)   # Zeitstempel = Beginn der letzten 15-Minuten-Kerze
+    state_path = STATE_FILE if args.ci else OUTPUT_DIR / "state.json"
+    state, new = update_state(load_state(state_path), results, now)
     path = write_outputs(results, now, include_forming, len(universe), not args.no_open,
-                         ci=args.ci, data_until=data_until)
+                         ci=args.ci, data_until=data_until, state=state, new=new)
+    save_state(state_path, state)
     set_output("ran", "true")
     print(f"Fertig: {int(results['long'].sum())} Long, {int(results['short'].sum())} Short -> {path}")
 
