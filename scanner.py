@@ -52,9 +52,10 @@ UNIVERSE_FILE = BASE_DIR / "universe.csv"
 STATE_FILE = BASE_DIR / "state.json"   # Merkt sich, seit wann ein Treffer besteht (Automatik-Modus)
 SITE_DIR = BASE_DIR / "site"   # Ausgabeordner im Automatik-Modus (wird als Webseite veröffentlicht)
 
-# Zeitfenster (New Yorker Zeit, Mo-Fr), in denen der Automatik-Lauf wirklich scannt: jeweils vor dem
-# Kerzenschluss um 12:45 und 16:00 (entspricht etwa 17:45 und 21:00 Wiener Zeit).
-DUE_WINDOWS = [((11, 20), (12, 40)), ((14, 30), (15, 30))]
+# Zeitfenster (New Yorker Zeit, Mo-Fr), in denen der Automatik-Lauf wirklich scannt. Geplant sind die Läufe
+# für 11:13 und 14:23 New Yorker Zeit (etwa 17:15 und 20:25 Wiener Zeit), GitHub startet sie oft verspätet.
+# Kerzenschluss ist um 12:45 und 16:00, danach ist es zu spät.
+DUE_WINDOWS = [((11, 0), (12, 40)), ((14, 10), (15, 30))]
 
 NY = ZoneInfo("America/New_York")
 VIE = ZoneInfo("Europe/Vienna")
