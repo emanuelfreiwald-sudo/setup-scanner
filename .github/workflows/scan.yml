@@ -2,14 +2,14 @@ name: Setup-Scan
 
 on:
   schedule:
-    # Ziel: 11:43 und 14:53 New Yorker Zeit (etwa 17:43 und 20:53 Wiener Zeit), also kurz vor
-    # dem Schluss der 195-Minuten-Kerzen um 12:45 und 16:00. Es gibt je zwei Einträge, einen für
-    # die Sommer- und einen für die Winterzeit der USA. Das Script prüft selbst, ob gerade ein
-    # passendes Zeitfenster ist, und überspringt den jeweils unpassenden Eintrag.
-    - cron: "43 15 * * 1-5"
-    - cron: "43 16 * * 1-5"
-    - cron: "53 18 * * 1-5"
-    - cron: "53 19 * * 1-5"
+    # Ziel: 11:13 und 14:23 New Yorker Zeit (normalerweise 17:13 und 20:23 Wiener Zeit), also gut eine
+    # Stunde vor dem Schluss der 195-Minuten-Kerzen um 12:45 und 16:00. GitHub startet geplante Läufe oft
+    # 5 bis 50 Minuten verspätet, deshalb der Vorlauf. Mit "timezone" stellt GitHub Sommer-/Winterzeit
+    # selbst um. Das Script prüft zusätzlich, ob gerade ein passendes Zeitfenster ist.
+    - cron: "13 11 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "23 14 * * 1-5"
+      timezone: "America/New_York"
   workflow_dispatch:   # Knopf "Run workflow" für manuelle Läufe (ignoriert das Zeitfenster)
 
 permissions:
@@ -54,8 +54,9 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v5
 
-      - name: Aktivität festhalten
-        # GitHub schaltet Zeitpläne in öffentlichen Repositories nach 60 Tagen ohne Aktivität ab.
+      - name: Aktivität und Verlauf festhalten
+        # state.json merkt sich, seit wann ein Treffer besteht. Die Commits halten außerdem den Zeitplan aktiv
+        # (GitHub schaltet Zeitpläne in öffentlichen Repositories nach 60 Tagen ohne Aktivität ab).
         if: steps.scan.outputs.ran == 'true'
         run: |
           date -u +"%Y-%m-%d %H:%M UTC" > last_run.txt
